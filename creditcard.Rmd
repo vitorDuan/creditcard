@@ -1,0 +1,128 @@
+---
+title: "credit card customer churn EDA"
+author: "陈炜锻"
+date: "`r format(Sys.time())`"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 4
+---
+
+# 1.概况
+## 1.1目标
+分析信用卡客户数据，查看流失客户和留存客户的各项特征，以及其在各个特征的分布状况，再拟合模型，得出各个特征对客户流失的影响程度
+
+## 1.2所需包
+```{r message=FALSE, warning=FALSE}
+library(randomForest)
+library(dplyr)
+library(ggplot2)
+library(plyr)
+library(DMwR)#SMOTE算法
+library(ggstatsplot)#快速画饼图
+library(gridExtra)#画板
+```
+
+# 2.处理数据
+读取信用卡客户数据，简单查看特征属性并对特征加以区分为“客户特征”和“商品特征”
+```{r}
+creditcard <- read.csv("E:/data/bank.csv")
+head(creditcard)
+str(creditcard)#Attrition_Flag是标记客户是否已流失
+colnames(creditcard)
+customer.variables <- colnames(creditcard)[3:8]
+product.variables <- colnames(creditcard)[9:21]
+```
+按二八比例划分训练集和测试集，并将测试集的分类列提取出来为后面模型测试做准备
+```{r}
+set.seed(123)
+num <- sample(1:nrow(creditcard),size=nrow(creditcard)*0.8,replace = F)
+creditcard.train <- creditcard[num,]
+creditcard.test <- creditcard[-num,]
+test.classify <- creditcard.test[,2]
+table(creditcard.train$Attrition_Flag)
+table(creditcard$Attrition_Flag)#流失客户与留存客户的比例较为接近
+```
+
+查看数据集是否存在重复项，空值
+```{r}
+isTRUE(duplicated(creditcard.train))
+isTRUE(is.null(creditcard.train))
+isTRUE(is.na(creditcard.train))
+```
+
+# 3.浏览数据
+首先，观察一下信用卡客户流失的整体情况
+```{r}
+ggpiestats(creditcard.train,"Attrition_Flag", results.subtitle = FALSE,
+           slice.label = "percentage", perc.k = 2,palette = "Pastel2",
+           title = "Attrition_Flag")
+```
+
+图中可见，信用卡客户绝大部分都留存下来，只有少数流失，说明数据十分不平衡，不利于拟合准确度高的模型，稍后需要进行过采样处理。接下来，再浏览客户特征的数据分布状况
+```{r}
+customer.facet <- function(x){#数值型数据用箱型图展示，因子型数据用条形图展示
+   y <- creditcard.train[,x]
+   if(class(y)=="factor"){
+   graph <- ggplot()+
+     geom_bar(data = creditcard.train, aes(x = y, fill = Attrition_Flag))+
+     labs(x = paste0(colnames(creditcard.train)[x]))+facet_grid(.~Attrition_Flag)
+     }else{
+      graph <- ggplot()+
+        geom_boxplot(data = creditcard.train, aes(x =Attrition_Flag, y=y))+
+        labs(x = paste0(colnames(creditcard.train)[x]))
+     }
+   return(graph)
+}
+
+customer.plot <- lapply(3:8,customer.facet)#3-8列特征属于客户特征
+marrangeGrob(customer.plot,nrow = 4,ncol = 2)
+```
+
+从图中可以观察到，客户流失与否的客户特征各项分布都没有显示出明显的差异。后面，浏览商品特征的分布状况。
+```{r}
+product.facet <- function(x){
+   y <- creditcard.train[,x]
+   graph <- ggplot()+
+     geom_bar(data = creditcard.train, aes(x = y, fill = Attrition_Flag))+
+     labs(x = paste0(colnames(creditcard.train)[x]))+facet_grid(.~Attrition_Flag)
+}
+
+product.plot1 <- lapply(9:12,product.facet)#9-21列特征属于商品特征
+marrangeGrob(product.plot1,nrow = 2,ncol = 2)
+product.plot2 <- lapply(13:16,product.facet)#9-21列特征属于商品特征
+marrangeGrob(product.plot2,nrow = 2,ncol = 2)
+product.plot3 <- lapply(17:21,product.facet)#9-21列特征属于商品特征
+marrangeGrob(product.plot3,nrow = 3,ncol = 2)
+```
+
+从Total_Relationship_Count列（购买产品数）的图中可见，留存客户比流失客户更倾向于购买更多的产品；从Months_Inactive_12_mon列（失活的月数）的图中可见，留存客户多为活跃客户（失活月数不多于3个月）；从Contacts_Count_12_mon列（接触数）的图中可见，流失客户比留存客户有更多的接触次数；从Total_Revolving_Bal列（总循环平衡）的图中可见，流失客户的循环平衡比留存客户的低；从Total_Trans_Amt列（总消费金额）、Total_Trans_Ct列（总消费单数）、Total_Ct_Chng_Q4_Q1列的图中可见，流失客户的总消费金额和总消费单数比较低；最后，在Avg_Utilization_Ratio列（平均使用率）的图中可以得出，流失客户的平均使用率更低。其他的商品特征的流失与否分布情况则差异不大。
+
+# 4.数据建模
+## 4.1SMOTE算法采样
+由于数据不平衡，即流失客户与留存客户的比例严重失调，在创建分类模型时可能会产生失准问题，因此需要对数据集运用SMOTE算法采样。SMOTE算法，即合成少数过采样技术，它是基于随机过采样算法的一种改进方案。SMOTE算法的基本思想就是对少数类别样本进行分析和KNN技术模拟，并将人工模拟的新样本添加到数据集中，具体：采样最邻近算法，计算出每个少数类样本的K个近邻，再从中随机挑选N个样本进行随机线性插值，构造新的少数类样本，最后将新样本与原数据合成，产生新的训练集。
+```{r}
+smote.data <- SMOTE(Attrition_Flag ~ .,creditcard.train)
+table(smote.data$Attrition_Flag)
+```
+结果可以看出，流失客户与留存客户的比例已经趋于1：1，已达到平衡标准。
+
+## 4.2拟合模型
+采用随机森林算法建模
+```{r}
+creditcard.randomforecast <- randomForest(Attrition_Flag~.,data = smote.data)
+```
+利用新的模型对测试集分类以检验模型性能
+```{r}
+creditcard.predict <- predict(creditcard.randomforecast, creditcard.test)
+table(creditcard.predict)
+table(test.classify)
+```
+从结果可以看出，预测的效果还是与实际值比较接近的，说明模型性能不错。最后再看一下各个特征的重要度
+```{r}
+feature.importance <- importance(creditcard.randomforecast,type = 2)
+importance.df <- data.frame(feature=colnames(creditcard.train)[-2],
+                            importance=feature.importance)
+head(importance.df[order(-importance.df$MeanDecreaseGini),],5)
+```
+筛选出重要度前五的特征，分别为 Total_Trans_Ct、Total_Trans_Amt、Total_Ct_Chng_Q4_Q1、Total_Revolving_Bal、Total_Relationship_Count
